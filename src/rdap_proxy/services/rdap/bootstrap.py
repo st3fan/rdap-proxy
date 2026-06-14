@@ -3,6 +3,7 @@ import ipaddress
 import logging
 import time
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any
 
 import httpx
@@ -20,43 +21,115 @@ IANA_BOOTSTRAP_URLS = {
 }
 
 
+@dataclass
+class _BootstrapSource:
+    """A single IANA bootstrap document plus its HTTP cache validators."""
+
+    url: str
+    etag: str | None = None
+    last_modified: str | None = None
+    services: list | None = None  # raw "services" array, kept to rebuild the index
+
+
 class RDAPBootstrap(ABC):
-    bootstrap_url: str  # defined by subclass
+    bootstrap_urls: tuple[str, ...]  # defined by subclass
+
+    # Fallback freshness when IANA sends no Cache-Control max-age.
+    _DEFAULT_TTL = 3600.0
+    # How far to push expiry out when a refresh fails but we have stale data.
+    _STALE_TTL = 300.0
 
     def __init__(self) -> None:
-        self._raw: dict[str, Any] | None = None
         self._lock = asyncio.Lock()
+        self._sources = [_BootstrapSource(url) for url in self.bootstrap_urls]
+        self._expiry = 0.0  # monotonic deadline; 0 == never fetched / expired
+        self._loaded = False
 
     async def fetch(self, *, force: bool = False) -> None:
-        """Fetch bootstrap data from IANA, building the internal index."""
-        async with self._lock:
-            if self._raw is not None and not force:
-                return
-            self._raw = await self._fetch_json(self.bootstrap_url)
-            start = time.perf_counter()
-            self._build_index(self._raw["services"])
-            logger.debug(
-                "Built %s index: %d entries in %.1f ms",
-                type(self).__name__,
-                len(self._index),
-                (time.perf_counter() - start) * 1000,
-            )
+        """Refresh bootstrap data if expired, using conditional HTTP requests.
 
-    async def _fetch_json(self, url: str) -> dict[str, Any]:
-        """Fetch and decode a single IANA bootstrap document."""
-        try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(url, timeout=10.0)
-                response.raise_for_status()
-                return response.json()
-        except httpx.HTTPError as e:
-            raise RDAPBootstrapError(
-                f"Failed to fetch bootstrap data from {url}: {e}"
-            ) from e
+        Cheap when fresh (no network). On expiry, issues If-None-Match /
+        If-Modified-Since requests; a 304 just renews the expiry, a 200
+        re-indexes. If the network fails but we already have data, the existing
+        index is kept and expiry is extended (serve stale).
+        """
+        async with self._lock:
+            now = time.monotonic()
+            if self._loaded and now < self._expiry and not force:
+                return
+
+            # Phase 1: network only. Bail out atomically on any failure.
+            responses: list[tuple[_BootstrapSource, httpx.Response]] = []
+            for source in self._sources:
+                try:
+                    response = await self._conditional_get(source)
+                    response.raise_for_status()
+                except httpx.HTTPError as e:
+                    if self._loaded:
+                        logger.warning(
+                            "Bootstrap refresh failed for %s; serving stale (%s)",
+                            source.url,
+                            e,
+                        )
+                        self._expiry = now + self._STALE_TTL
+                        return
+                    raise RDAPBootstrapError(
+                        f"Failed to fetch bootstrap data from {source.url}: {e}"
+                    ) from e
+                responses.append((source, response))
+
+            # Phase 2: commit. Only 200s change data and force a re-index.
+            max_ages: list[float] = []
+            dirty = False
+            for source, response in responses:
+                max_ages.append(self._max_age(response))
+                if response.status_code == 200:
+                    source.etag = response.headers.get("ETag")
+                    source.last_modified = response.headers.get("Last-Modified")
+                    source.services = response.json()["services"]
+                    dirty = True
+
+            self._expiry = now + min(max_ages, default=self._DEFAULT_TTL)
+
+            if dirty or not self._loaded:
+                start = time.perf_counter()
+                combined = [
+                    entry for source in self._sources for entry in (source.services or [])
+                ]
+                self._build_index(combined)
+                logger.debug(
+                    "Built %s index: %d entries in %.1f ms",
+                    type(self).__name__,
+                    len(self._index),
+                    (time.perf_counter() - start) * 1000,
+                )
+            self._loaded = True
+
+    async def _conditional_get(self, source: _BootstrapSource) -> httpx.Response:
+        """GET a bootstrap document, sending cache validators when known."""
+        headers = {}
+        if source.etag:
+            headers["If-None-Match"] = source.etag
+        if source.last_modified:
+            headers["If-Modified-Since"] = source.last_modified
+        async with httpx.AsyncClient() as client:
+            return await client.get(source.url, headers=headers, timeout=10.0)
+
+    def _max_age(self, response: httpx.Response) -> float:
+        """Seconds of freshness from the Cache-Control max-age, else the default."""
+        cache_control = response.headers.get("Cache-Control", "")
+        for part in cache_control.split(","):
+            part = part.strip().lower()
+            if part.startswith("max-age="):
+                try:
+                    return float(part.removeprefix("max-age="))
+                except ValueError:
+                    break
+        return self._DEFAULT_TTL
 
     async def _ensure_fetched(self) -> None:
-        if self._raw is None:
-            await self.fetch()
+        # fetch() is the lazy expiry gate; cheap when data is still fresh.
+        await self.fetch()
 
     @abstractmethod
     def _build_index(self, services: list) -> None:
@@ -78,7 +151,7 @@ class RDAPBootstrap(ABC):
 
 
 class RDAPDomainBootstrap(RDAPBootstrap):
-    bootstrap_url = IANA_BOOTSTRAP_URLS["domain"]
+    bootstrap_urls = (IANA_BOOTSTRAP_URLS["domain"],)
 
     def __init__(self) -> None:
         super().__init__()
@@ -104,6 +177,9 @@ class RDAPDomainBootstrap(RDAPBootstrap):
 
 
 class RDAPIPBootstrap(RDAPBootstrap):
+    # IANA splits IP space across two bootstrap files; the base loads both.
+    bootstrap_urls = (IANA_BOOTSTRAP_URLS["ipv4"], IANA_BOOTSTRAP_URLS["ipv6"])
+
     def __init__(self) -> None:
         super().__init__()
         # (network, base_url), searched by longest-prefix match.
@@ -111,28 +187,8 @@ class RDAPIPBootstrap(RDAPBootstrap):
             tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, str]
         ] = []
 
-    async def fetch(self, *, force: bool = False) -> None:
-        # IANA splits IP space across two bootstrap files; load both.
-        async with self._lock:
-            if self._raw is not None and not force:
-                return
-            self._index.clear()
-            raw: dict[str, Any] = {}
-            build_seconds = 0.0
-            for family in ("ipv4", "ipv6"):
-                data = await self._fetch_json(IANA_BOOTSTRAP_URLS[family])
-                start = time.perf_counter()
-                self._build_index(data["services"])
-                build_seconds += time.perf_counter() - start
-                raw[family] = data
-            self._raw = raw  # set last, so a mid-fetch failure retries next time
-            logger.debug(
-                "Built IP bootstrap index: %d networks in %.1f ms",
-                len(self._index),
-                build_seconds * 1000,
-            )
-
     def _build_index(self, services: list) -> None:
+        self._index.clear()
         for cidrs, urls in services:
             url = self._pick_url(urls)
             for cidr in cidrs:
@@ -153,7 +209,7 @@ class RDAPIPBootstrap(RDAPBootstrap):
 
 
 class RDAPASNBootstrap(RDAPBootstrap):
-    bootstrap_url = IANA_BOOTSTRAP_URLS["asn"]
+    bootstrap_urls = (IANA_BOOTSTRAP_URLS["asn"],)
 
     def __init__(self) -> None:
         super().__init__()

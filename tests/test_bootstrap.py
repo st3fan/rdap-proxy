@@ -1,25 +1,37 @@
-"""Tests for RDAPIPBootstrap index building and longest-prefix lookup."""
+"""Tests for bootstrap index building, lookup, and HTTP-cached refresh."""
 
+import time
+
+import httpx
 import pytest
 
-from rdap_proxy.services.rdap.bootstrap import RDAPASNBootstrap, RDAPIPBootstrap
-from rdap_proxy.services.rdap.exceptions import RDAPNotFoundError
+from rdap_proxy.services.rdap.bootstrap import (
+    RDAPASNBootstrap,
+    RDAPDomainBootstrap,
+    RDAPIPBootstrap,
+)
+from rdap_proxy.services.rdap.exceptions import RDAPBootstrapError, RDAPNotFoundError
+
+
+def _seed(b):
+    """Mark a bootstrap as loaded and fresh so lookup_service skips the network."""
+    b._loaded = True
+    b._expiry = time.monotonic() + 3600
+    return b
 
 
 def _bootstrap(services: list) -> RDAPIPBootstrap:
     """Build an IP bootstrap with a pre-populated index (no network fetch)."""
     b = RDAPIPBootstrap()
     b._build_index(services)
-    b._raw = {}  # mark as fetched so lookup_service() skips the network
-    return b
+    return _seed(b)
 
 
 def _asn_bootstrap(services: list) -> RDAPASNBootstrap:
     """Build an ASN bootstrap with a pre-populated index (no network fetch)."""
     b = RDAPASNBootstrap()
     b._build_index(services)
-    b._raw = {}
-    return b
+    return _seed(b)
 
 
 async def test_ipv4_match_returns_base_url() -> None:
@@ -94,3 +106,137 @@ async def test_invalid_asn_raises_not_found() -> None:
     b = _asn_bootstrap([[["13"], ["https://rdap.arin.net/"]]])
     with pytest.raises(RDAPNotFoundError):
         await b.lookup_service("not-an-asn")
+
+
+# --- HTTP-cached refresh -------------------------------------------------------
+
+
+def _response(status: int, *, services=None, max_age=60, etag=None) -> httpx.Response:
+    headers = {"Cache-Control": f"max-age={max_age}"}
+    if etag is not None:
+        headers["ETag"] = etag
+    json = {"services": services or []} if status == 200 else None
+    request = httpx.Request("GET", "https://data.iana.org/rdap/dns.json")
+    return httpx.Response(status, json=json, headers=headers, request=request)
+
+
+def _patch_get(monkeypatch, responses: list[httpx.Response]) -> list[dict]:
+    """Patch _conditional_get to return queued responses; record sent headers."""
+    sent: list[dict] = []
+    queue = list(responses)
+
+    async def fake_get(self, source):
+        sent.append(
+            {
+                "url": source.url,
+                "If-None-Match": source.etag,
+                "If-Modified-Since": source.last_modified,
+            }
+        )
+        return queue.pop(0)
+
+    monkeypatch.setattr(
+        "rdap_proxy.services.rdap.bootstrap.RDAPBootstrap._conditional_get", fake_get
+    )
+    return sent
+
+
+async def test_initial_fetch_builds_index(monkeypatch) -> None:
+    _patch_get(monkeypatch, [_response(200, services=[[["com"], ["https://v/"]]])])
+    b = RDAPDomainBootstrap()
+    await b.fetch()
+    assert b._loaded
+    service = await b.lookup_service("example.com")
+    assert service is not None and service.base_url == "https://v"
+
+
+async def test_no_refetch_within_ttl(monkeypatch) -> None:
+    sent = _patch_get(
+        monkeypatch, [_response(200, services=[[["com"], ["https://v/"]]], max_age=300)]
+    )
+    b = RDAPDomainBootstrap()
+    await b.fetch()
+    await b.fetch()  # still fresh -> no network
+    assert len(sent) == 1
+
+
+async def test_304_renews_expiry_without_reindex(monkeypatch) -> None:
+    _patch_get(
+        monkeypatch,
+        [
+            _response(200, services=[[["com"], ["https://v/"]]], etag="v1", max_age=0),
+            _response(304, max_age=120),
+        ],
+    )
+    b = RDAPDomainBootstrap()
+    await b.fetch()  # 200, builds index, expires immediately (max-age=0)
+
+    calls = []
+    original = b._build_index
+    monkeypatch.setattr(b, "_build_index", lambda s: calls.append(s) or original(s))
+
+    await b.fetch()  # expired -> conditional GET -> 304
+    assert calls == []  # not rebuilt
+    assert b._expiry > time.monotonic()  # expiry renewed
+    assert (await b.lookup_service("example.com")).base_url == "https://v"
+
+
+async def test_200_on_refresh_reindexes(monkeypatch) -> None:
+    _patch_get(
+        monkeypatch,
+        [
+            _response(200, services=[[["com"], ["https://old/"]]], max_age=60),
+            _response(200, services=[[["com"], ["https://new/"]]], max_age=60),
+        ],
+    )
+    b = RDAPDomainBootstrap()
+    await b.fetch()
+    assert (await b.lookup_service("example.com")).base_url == "https://old"  # fresh
+    b._expiry = time.monotonic() - 1  # force expiry
+    await b.fetch()  # 200 with changed data -> rebuild
+    assert (await b.lookup_service("example.com")).base_url == "https://new"
+
+
+async def test_conditional_headers_sent_after_etag_known(monkeypatch) -> None:
+    sent = _patch_get(
+        monkeypatch,
+        [
+            _response(200, services=[[["com"], ["https://v/"]]], etag="v1", max_age=0),
+            _response(304),
+        ],
+    )
+    b = RDAPDomainBootstrap()
+    await b.fetch()
+    await b.fetch()
+    assert sent[0]["If-None-Match"] is None  # first request: no validator yet
+    assert sent[1]["If-None-Match"] == "v1"  # second: conditional
+
+
+async def test_serve_stale_on_refresh_failure(monkeypatch) -> None:
+    _patch_get(
+        monkeypatch, [_response(200, services=[[["com"], ["https://v/"]]], max_age=0)]
+    )
+    b = RDAPDomainBootstrap()
+    await b.fetch()  # loaded, immediately expired
+
+    async def boom(self, source):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(
+        "rdap_proxy.services.rdap.bootstrap.RDAPBootstrap._conditional_get", boom
+    )
+    await b.fetch()  # must not raise
+    assert (await b.lookup_service("example.com")).base_url == "https://v"  # stale kept
+    assert b._expiry > time.monotonic()  # expiry extended
+
+
+async def test_initial_failure_raises(monkeypatch) -> None:
+    async def boom(self, source):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(
+        "rdap_proxy.services.rdap.bootstrap.RDAPBootstrap._conditional_get", boom
+    )
+    b = RDAPDomainBootstrap()
+    with pytest.raises(RDAPBootstrapError):
+        await b.fetch()
