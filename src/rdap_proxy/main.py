@@ -1,5 +1,6 @@
 import logging
 
+import httpx
 from litestar import Litestar, Request, Response
 from litestar.datastructures import State
 from litestar.di import Provide
@@ -20,15 +21,27 @@ logger = logging.getLogger(__name__)
 
 
 async def on_startup(app: Litestar) -> None:
-    """Create the single, shared RDAPResolver and warm its bootstraps."""
-    resolver = RDAPResolver()
+    """Create the shared HTTP client and RDAPResolver, then warm the bootstraps."""
+    # One pooled client for the app's lifetime: keep-alive and TLS reuse across
+    # all upstream RDAP and IANA bootstrap requests, instead of one client per
+    # request. Created on the running loop and closed in on_shutdown.
+    client = httpx.AsyncClient()
+    resolver = RDAPResolver(client=client)
     try:
         await resolver.warm()
     except RDAPBootstrapError:
         # Best-effort prefetch: don't block startup if IANA is briefly
         # unreachable. The resolver retries lazily on the first request.
         logger.warning("Bootstrap warm-up failed; will fetch lazily", exc_info=True)
+    app.state.http_client = client
     app.state.rdap_resolver = resolver
+
+
+async def on_shutdown(app: Litestar) -> None:
+    """Cancel in-flight background refreshes, then close the shared client."""
+    resolver: RDAPResolver = app.state.rdap_resolver
+    await resolver.aclose()  # stop refreshes before the pool they use goes away
+    await app.state.http_client.aclose()
 
 
 def provide_rdap_resolver(state: State) -> RDAPResolver:
@@ -70,6 +83,7 @@ def create_app() -> Litestar:
     return Litestar(
         route_handlers=[health.router, rdap.RDAPController],
         on_startup=[on_startup],
+        on_shutdown=[on_shutdown],
         stores=stores,
         dependencies={
             "rdap": Provide(provide_rdap_resolver, sync_to_thread=False),

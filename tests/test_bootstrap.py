@@ -323,3 +323,41 @@ async def test_build_index_returns_fresh_without_mutating() -> None:
     assert rebuilt is not live  # a fresh object, not the same one mutated
     assert b._index is live and b._index == {"com": "https://old/"}  # live unchanged
     assert rebuilt == {"net": "https://new/"}
+
+
+# --- Shared HTTP client --------------------------------------------------------
+
+
+async def test_lookup_service_forwards_client() -> None:
+    client = httpx.AsyncClient()
+    b = RDAPDomainBootstrap(client=client)
+    b._index = b._build_index([[["com"], ["https://v/"]]])
+    _seed(b)
+
+    service = await b.lookup_service("example.com")
+    await client.aclose()
+
+    assert service is not None
+    assert service._client is client  # the pooled client is threaded through
+
+
+async def test_aclose_cancels_in_flight_refresh(monkeypatch) -> None:
+    started = asyncio.Event()
+
+    async def hang(self, source):
+        started.set()
+        await asyncio.sleep(3600)  # never completes on its own
+
+    monkeypatch.setattr(
+        "rdap_proxy.services.rdap.bootstrap.RDAPBootstrap._conditional_get", hang
+    )
+    b = RDAPDomainBootstrap()
+    b._index = b._build_index([[["com"], ["https://old/"]]])
+    b._loaded = True
+    b._expiry = time.monotonic() - 1  # stale -> lookup schedules a refresh
+
+    await b.lookup_service("example.com")  # serves stale, kicks off refresh
+    await started.wait()  # ensure the background refresh is actually running
+
+    await b.aclose()  # must cancel it and return promptly
+    assert b._refresh_task.cancelled()

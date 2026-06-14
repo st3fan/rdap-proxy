@@ -7,8 +7,11 @@ from .models import RDAPQueryType
 
 
 class RDAPService:
-    def __init__(self, base_url: str) -> None:
+    def __init__(
+        self, base_url: str, client: httpx.AsyncClient | None = None
+    ) -> None:
         self.base_url = base_url.rstrip("/")
+        self._client = client
 
     def _build_url(self, query: str, query_type: RDAPQueryType) -> str:
         match query_type:
@@ -29,13 +32,7 @@ class RDAPService:
     async def query(self, query: str, query_type: RDAPQueryType) -> Any:
         url = self._build_url(query, query_type)
         try:
-            async with httpx.AsyncClient() as client:
-                response = await client.get(
-                    url,
-                    headers={"Accept": "application/rdap+json"},
-                    follow_redirects=True,
-                    timeout=10.0,
-                )
+            response = await self._get(url)
         except httpx.HTTPError as e:
             raise RDAPServiceError(
                 f"HTTP error querying RDAP service at {url}: {e}"
@@ -65,6 +62,18 @@ class RDAPService:
         # return RDAPResponse.from_dict(data)
 
         return data
+
+    async def _get(self, url: str) -> httpx.Response:
+        """GET via the shared client, or a throwaway one if none was injected."""
+        headers = {"Accept": "application/rdap+json"}
+        if self._client is not None:
+            return await self._client.get(
+                url, headers=headers, follow_redirects=True, timeout=10.0
+            )
+        async with httpx.AsyncClient() as client:
+            return await client.get(
+                url, headers=headers, follow_redirects=True, timeout=10.0
+            )
 
     def __repr__(self) -> str:
         return f"RDAPService(base_url={self.base_url!r})"

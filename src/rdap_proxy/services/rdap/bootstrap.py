@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import ipaddress
 import logging
 import time
@@ -42,12 +43,13 @@ class RDAPBootstrap(ABC, Generic[IndexT]):
     # How far to push expiry out when a refresh fails but we have stale data.
     _STALE_TTL = 300.0
 
-    def __init__(self) -> None:
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
         self._lock = asyncio.Lock()
         self._sources = [_BootstrapSource(url) for url in self.bootstrap_urls]
         self._expiry = 0.0  # monotonic deadline; 0 == never fetched / expired
         self._loaded = False
         self._refresh_task: asyncio.Task | None = None
+        self._client = client
 
     async def fetch(self, *, force: bool = False) -> None:
         """Refresh bootstrap data if expired, using conditional HTTP requests.
@@ -120,6 +122,8 @@ class RDAPBootstrap(ABC, Generic[IndexT]):
             headers["If-None-Match"] = source.etag
         if source.last_modified:
             headers["If-Modified-Since"] = source.last_modified
+        if self._client is not None:
+            return await self._client.get(source.url, headers=headers, timeout=10.0)
         async with httpx.AsyncClient() as client:
             return await client.get(source.url, headers=headers, timeout=10.0)
 
@@ -174,6 +178,14 @@ class RDAPBootstrap(ABC, Generic[IndexT]):
                 exc_info=True,
             )
 
+    async def aclose(self) -> None:
+        """Cancel an in-flight background refresh so it can't outlive the client."""
+        task = self._refresh_task
+        if task is not None and not task.done():
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
+
     @abstractmethod
     def _build_index(self, services: list) -> IndexT:
         """Build and return a fresh index structure for fast lookup.
@@ -202,8 +214,8 @@ class RDAPBootstrap(ABC, Generic[IndexT]):
 class RDAPDomainBootstrap(RDAPBootstrap[dict[str, str]]):
     bootstrap_urls = (IANA_BOOTSTRAP_URLS["domain"],)
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        super().__init__(client)
         self._index: dict[str, str] = {}  # tld -> base_url
 
     def _build_index(self, services: list) -> dict[str, str]:
@@ -223,7 +235,7 @@ class RDAPDomainBootstrap(RDAPBootstrap[dict[str, str]]):
         for i in range(len(labels)):
             candidate = ".".join(labels[i:])
             if candidate in self._index:
-                return RDAPService(self._index[candidate])
+                return RDAPService(self._index[candidate], client=self._client)
 
 
 class RDAPIPBootstrap(
@@ -232,8 +244,8 @@ class RDAPIPBootstrap(
     # IANA splits IP space across two bootstrap files; the base loads both.
     bootstrap_urls = (IANA_BOOTSTRAP_URLS["ipv4"], IANA_BOOTSTRAP_URLS["ipv6"])
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        super().__init__(client)
         # (network, base_url), searched by longest-prefix match.
         self._index: list[
             tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, str]
@@ -260,14 +272,14 @@ class RDAPIPBootstrap(
         for network, url in self._index:
             if addr in network and (best is None or network.prefixlen > best[0].prefixlen):
                 best = (network, url)
-        return RDAPService(best[1]) if best else None
+        return RDAPService(best[1], client=self._client) if best else None
 
 
 class RDAPASNBootstrap(RDAPBootstrap[list[tuple[int, int, str]]]):
     bootstrap_urls = (IANA_BOOTSTRAP_URLS["asn"],)
 
-    def __init__(self) -> None:
-        super().__init__()
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        super().__init__(client)
         # (start, end, base_url) inclusive AS-number ranges.
         self._index: list[tuple[int, int, str]] = []
 
@@ -290,5 +302,5 @@ class RDAPASNBootstrap(RDAPBootstrap[list[tuple[int, int, str]]]):
 
         for low, high, url in self._index:
             if low <= asn <= high:
-                return RDAPService(url)
+                return RDAPService(url, client=self._client)
         return None
