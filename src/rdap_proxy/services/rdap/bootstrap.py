@@ -4,7 +4,7 @@ import logging
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, Generic, TypeVar
 
 import httpx
 
@@ -31,7 +31,10 @@ class _BootstrapSource:
     services: list | None = None  # raw "services" array, kept to rebuild the index
 
 
-class RDAPBootstrap(ABC):
+IndexT = TypeVar("IndexT")
+
+
+class RDAPBootstrap(ABC, Generic[IndexT]):
     bootstrap_urls: tuple[str, ...]  # defined by subclass
 
     # Fallback freshness when IANA sends no Cache-Control max-age.
@@ -97,11 +100,15 @@ class RDAPBootstrap(ABC):
                 combined = [
                     entry for source in self._sources for entry in (source.services or [])
                 ]
-                self._build_index(combined)
+                # Build off the event loop, then swap the reference in a single
+                # assignment. Readers (which don't take the lock) always see a
+                # complete index -- the old one or the new one, never a partial.
+                new_index = await asyncio.to_thread(self._build_index, combined)
+                self._index = new_index
                 logger.debug(
                     "Built %s index: %d entries in %.1f ms",
                     type(self).__name__,
-                    len(self._index),
+                    len(new_index),
                     (time.perf_counter() - start) * 1000,
                 )
             self._loaded = True
@@ -168,8 +175,14 @@ class RDAPBootstrap(ABC):
             )
 
     @abstractmethod
-    def _build_index(self, services: list) -> None:
-        """Build whatever internal index structure is needed for fast lookup."""
+    def _build_index(self, services: list) -> IndexT:
+        """Build and return a fresh index structure for fast lookup.
+
+        Must be pure with respect to instance state -- it reads only its
+        argument (and the read-only _pick_url helper) and returns a brand-new
+        structure. fetch() swaps it into self._index atomically. This keeps the
+        method safe to run off the event loop via asyncio.to_thread.
+        """
         ...
 
     @abstractmethod
@@ -186,19 +199,20 @@ class RDAPBootstrap(ABC):
         return https[0] if https else urls[0]
 
 
-class RDAPDomainBootstrap(RDAPBootstrap):
+class RDAPDomainBootstrap(RDAPBootstrap[dict[str, str]]):
     bootstrap_urls = (IANA_BOOTSTRAP_URLS["domain"],)
 
     def __init__(self) -> None:
         super().__init__()
         self._index: dict[str, str] = {}  # tld -> base_url
 
-    def _build_index(self, services: list) -> None:
-        self._index.clear()
+    def _build_index(self, services: list) -> dict[str, str]:
+        index: dict[str, str] = {}
         for tlds, urls in services:
             url = self._pick_url(urls)
             for tld in tlds:
-                self._index[tld.lower()] = url
+                index[tld.lower()] = url
+        return index
 
     async def lookup_service(self, query: str) -> RDAPService | None:
         await self._ensure_fetched()
@@ -212,7 +226,9 @@ class RDAPDomainBootstrap(RDAPBootstrap):
                 return RDAPService(self._index[candidate])
 
 
-class RDAPIPBootstrap(RDAPBootstrap):
+class RDAPIPBootstrap(
+    RDAPBootstrap[list[tuple["ipaddress.IPv4Network | ipaddress.IPv6Network", str]]]
+):
     # IANA splits IP space across two bootstrap files; the base loads both.
     bootstrap_urls = (IANA_BOOTSTRAP_URLS["ipv4"], IANA_BOOTSTRAP_URLS["ipv6"])
 
@@ -223,12 +239,15 @@ class RDAPIPBootstrap(RDAPBootstrap):
             tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, str]
         ] = []
 
-    def _build_index(self, services: list) -> None:
-        self._index.clear()
+    def _build_index(
+        self, services: list
+    ) -> list[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, str]]:
+        index: list[tuple[ipaddress.IPv4Network | ipaddress.IPv6Network, str]] = []
         for cidrs, urls in services:
             url = self._pick_url(urls)
             for cidr in cidrs:
-                self._index.append((ipaddress.ip_network(cidr), url))
+                index.append((ipaddress.ip_network(cidr), url))
+        return index
 
     async def lookup_service(self, query: str) -> RDAPService | None:
         await self._ensure_fetched()
@@ -244,7 +263,7 @@ class RDAPIPBootstrap(RDAPBootstrap):
         return RDAPService(best[1]) if best else None
 
 
-class RDAPASNBootstrap(RDAPBootstrap):
+class RDAPASNBootstrap(RDAPBootstrap[list[tuple[int, int, str]]]):
     bootstrap_urls = (IANA_BOOTSTRAP_URLS["asn"],)
 
     def __init__(self) -> None:
@@ -252,14 +271,15 @@ class RDAPASNBootstrap(RDAPBootstrap):
         # (start, end, base_url) inclusive AS-number ranges.
         self._index: list[tuple[int, int, str]] = []
 
-    def _build_index(self, services: list) -> None:
-        self._index.clear()
+    def _build_index(self, services: list) -> list[tuple[int, int, str]]:
+        index: list[tuple[int, int, str]] = []
         for ranges, urls in services:
             url = self._pick_url(urls)
             for asn_range in ranges:
                 start, _, end = asn_range.partition("-")
                 low = int(start)
-                self._index.append((low, int(end) if end else low, url))
+                index.append((low, int(end) if end else low, url))
+        return index
 
     async def lookup_service(self, query: int | str) -> RDAPService | None:
         await self._ensure_fetched()

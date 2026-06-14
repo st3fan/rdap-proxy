@@ -24,14 +24,14 @@ def _seed(b):
 def _bootstrap(services: list) -> RDAPIPBootstrap:
     """Build an IP bootstrap with a pre-populated index (no network fetch)."""
     b = RDAPIPBootstrap()
-    b._build_index(services)
+    b._index = b._build_index(services)
     return _seed(b)
 
 
 def _asn_bootstrap(services: list) -> RDAPASNBootstrap:
     """Build an ASN bootstrap with a pre-populated index (no network fetch)."""
     b = RDAPASNBootstrap()
-    b._build_index(services)
+    b._index = b._build_index(services)
     return _seed(b)
 
 
@@ -249,7 +249,7 @@ async def test_initial_failure_raises(monkeypatch) -> None:
 async def test_stale_lookup_serves_old_data_then_refreshes(monkeypatch) -> None:
     _patch_get(monkeypatch, [_response(200, services=[[["com"], ["https://new/"]]])])
     b = RDAPDomainBootstrap()
-    b._build_index([[["com"], ["https://old/"]]])
+    b._index = b._build_index([[["com"], ["https://old/"]]])
     b._loaded = True
     b._expiry = time.monotonic() - 1  # loaded but stale
 
@@ -268,7 +268,7 @@ async def test_concurrent_stale_lookups_trigger_single_refresh(monkeypatch) -> N
         monkeypatch, [_response(200, services=[[["com"], ["https://new/"]]])]
     )
     b = RDAPDomainBootstrap()
-    b._build_index([[["com"], ["https://old/"]]])
+    b._index = b._build_index([[["com"], ["https://old/"]]])
     b._loaded = True
     b._expiry = time.monotonic() - 1  # stale
 
@@ -289,7 +289,7 @@ async def test_cold_lookup_blocks_until_loaded(monkeypatch) -> None:
 
 async def test_background_refresh_failure_keeps_stale(monkeypatch) -> None:
     b = RDAPDomainBootstrap()
-    b._build_index([[["com"], ["https://old/"]]])
+    b._index = b._build_index([[["com"], ["https://old/"]]])
     b._loaded = True
     b._expiry = time.monotonic() - 1  # stale
 
@@ -305,3 +305,21 @@ async def test_background_refresh_failure_keeps_stale(monkeypatch) -> None:
     await b._refresh_task  # must not raise
     assert (await b.lookup_service("example.com")).base_url == "https://old"  # kept
     assert b._expiry > time.monotonic()  # expiry extended by stale TTL
+
+
+# --- Atomic index swap ---------------------------------------------------------
+
+
+async def test_build_index_returns_fresh_without_mutating() -> None:
+    # _build_index must produce a brand-new structure and leave the live index
+    # untouched; only an explicit assignment (the atomic swap in fetch()) updates
+    # it. Guards against regressing to in-place clear()+repopulate.
+    b = RDAPDomainBootstrap()
+    b._index = b._build_index([[["com"], ["https://old/"]]])
+    live = b._index
+
+    rebuilt = b._build_index([[["net"], ["https://new/"]]])
+
+    assert rebuilt is not live  # a fresh object, not the same one mutated
+    assert b._index is live and b._index == {"com": "https://old/"}  # live unchanged
+    assert rebuilt == {"net": "https://new/"}
