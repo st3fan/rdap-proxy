@@ -44,6 +44,7 @@ class RDAPBootstrap(ABC):
         self._sources = [_BootstrapSource(url) for url in self.bootstrap_urls]
         self._expiry = 0.0  # monotonic deadline; 0 == never fetched / expired
         self._loaded = False
+        self._refresh_task: asyncio.Task | None = None
 
     async def fetch(self, *, force: bool = False) -> None:
         """Refresh bootstrap data if expired, using conditional HTTP requests.
@@ -128,8 +129,43 @@ class RDAPBootstrap(ABC):
         return self._DEFAULT_TTL
 
     async def _ensure_fetched(self) -> None:
-        # fetch() is the lazy expiry gate; cheap when data is still fresh.
-        await self.fetch()
+        """Stale-while-revalidate gate for lookups.
+
+        Fresh data returns immediately (no lock). With no data at all we must
+        block on the first fetch. Once we have data but it has expired, we serve
+        the stale index right away and refresh in the background, so readers are
+        never blocked on a slow IANA round-trip.
+        """
+        if self._loaded and time.monotonic() < self._expiry:
+            return
+        if not self._loaded:
+            await self.fetch()  # cold start: nothing to serve, must block
+            return
+        self._schedule_refresh()  # stale: serve old index, refresh in background
+
+    def _schedule_refresh(self) -> None:
+        """Start a single background refresh, coalescing concurrent stale readers.
+
+        Runs entirely on the event loop with no await, so the check-and-create is
+        atomic against other coroutines: at most one refresh task is ever in
+        flight. The reference is kept so the task is not garbage-collected mid-run.
+        """
+        if self._refresh_task is not None and not self._refresh_task.done():
+            return
+        self._refresh_task = asyncio.create_task(self._refresh_in_background())
+
+    async def _refresh_in_background(self) -> None:
+        # fetch() already serves stale and extends expiry on network failure when
+        # loaded; this guard is defensive against unexpected errors and stops a
+        # background-task exception from being swallowed silently.
+        try:
+            await self.fetch()
+        except Exception:
+            logger.warning(
+                "Background bootstrap refresh failed for %s",
+                type(self).__name__,
+                exc_info=True,
+            )
 
     @abstractmethod
     def _build_index(self, services: list) -> None:
