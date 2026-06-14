@@ -1,5 +1,6 @@
 """Tests for bootstrap index building, lookup, and HTTP-cached refresh."""
 
+import asyncio
 import time
 
 import httpx
@@ -240,3 +241,67 @@ async def test_initial_failure_raises(monkeypatch) -> None:
     b = RDAPDomainBootstrap()
     with pytest.raises(RDAPBootstrapError):
         await b.fetch()
+
+
+# --- Stale-while-revalidate ----------------------------------------------------
+
+
+async def test_stale_lookup_serves_old_data_then_refreshes(monkeypatch) -> None:
+    _patch_get(monkeypatch, [_response(200, services=[[["com"], ["https://new/"]]])])
+    b = RDAPDomainBootstrap()
+    b._build_index([[["com"], ["https://old/"]]])
+    b._loaded = True
+    b._expiry = time.monotonic() - 1  # loaded but stale
+
+    # Lookup serves the stale index immediately; the background task has been
+    # scheduled but cannot have run yet (no intervening await on the loop).
+    service = await b.lookup_service("example.com")
+    assert service.base_url == "https://old"
+    assert b._refresh_task is not None
+
+    await b._refresh_task  # let the background refresh complete
+    assert (await b.lookup_service("example.com")).base_url == "https://new"
+
+
+async def test_concurrent_stale_lookups_trigger_single_refresh(monkeypatch) -> None:
+    sent = _patch_get(
+        monkeypatch, [_response(200, services=[[["com"], ["https://new/"]]])]
+    )
+    b = RDAPDomainBootstrap()
+    b._build_index([[["com"], ["https://old/"]]])
+    b._loaded = True
+    b._expiry = time.monotonic() - 1  # stale
+
+    results = await asyncio.gather(*(b.lookup_service("example.com") for _ in range(5)))
+    assert all(s.base_url == "https://old" for s in results)  # all served stale
+
+    await b._refresh_task
+    assert len(sent) == len(b._sources)  # exactly one refresh round, not one per reader
+
+
+async def test_cold_lookup_blocks_until_loaded(monkeypatch) -> None:
+    _patch_get(monkeypatch, [_response(200, services=[[["com"], ["https://v/"]]])])
+    b = RDAPDomainBootstrap()  # not loaded
+    service = await b.lookup_service("example.com")  # cold path must block and fetch
+    assert service is not None and service.base_url == "https://v"
+    assert b._loaded
+
+
+async def test_background_refresh_failure_keeps_stale(monkeypatch) -> None:
+    b = RDAPDomainBootstrap()
+    b._build_index([[["com"], ["https://old/"]]])
+    b._loaded = True
+    b._expiry = time.monotonic() - 1  # stale
+
+    async def boom(self, source):
+        raise httpx.ConnectError("network down")
+
+    monkeypatch.setattr(
+        "rdap_proxy.services.rdap.bootstrap.RDAPBootstrap._conditional_get", boom
+    )
+    service = await b.lookup_service("example.com")
+    assert service.base_url == "https://old"  # stale served immediately
+
+    await b._refresh_task  # must not raise
+    assert (await b.lookup_service("example.com")).base_url == "https://old"  # kept
+    assert b._expiry > time.monotonic()  # expiry extended by stale TTL
