@@ -1,21 +1,31 @@
 import asyncio
 from typing import Any
 
+import httpx
+
 from .bootstrap import RDAPASNBootstrap, RDAPDomainBootstrap, RDAPIPBootstrap
 from .models import RDAPQueryType
 
 
 class RDAPResolver:
-    def __init__(self) -> None:
-        self._domain_bootstrap = RDAPDomainBootstrap()
-        self._ip_bootstrap = RDAPIPBootstrap()
-        self._asn_bootstrap = RDAPASNBootstrap()
+    def __init__(self, client: httpx.AsyncClient | None = None) -> None:
+        self._domain_bootstrap = RDAPDomainBootstrap(client=client)
+        self._ip_bootstrap = RDAPIPBootstrap(client=client)
+        self._asn_bootstrap = RDAPASNBootstrap(client=client)
 
     async def warm(self) -> None:
         await asyncio.gather(
             self._domain_bootstrap.fetch(),
             self._ip_bootstrap.fetch(),
             self._asn_bootstrap.fetch(),
+        )
+
+    async def aclose(self) -> None:
+        """Cancel any in-flight background refreshes across all bootstraps."""
+        await asyncio.gather(
+            self._domain_bootstrap.aclose(),
+            self._ip_bootstrap.aclose(),
+            self._asn_bootstrap.aclose(),
         )
 
     async def lookup_domain(self, fqdn: str) -> Any:
